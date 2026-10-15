@@ -7,3 +7,8 @@ Team Reflection:
 One thing that we did really well was being creative, as we were able to come up with a unique game design that was actually really fun to play. However, one limitation
 of our game was that we didn't really get it working with 3 people. One improvement was that we started with pretty clunky controls for the elephant, but we simplified
 them, and that made things a lot easier to control.
+
+Team Members:
+Adin
+Evan
+Grey
