@@ -1,0 +1,221 @@
+diff --git a/Tracking/bridge.py b/Tracking/bridge.py
+index f55589c..dbd1f69 100644
+--- a/Tracking/bridge.py
++++ b/Tracking/bridge.py
+@@ -1,5 +1,6 @@
+ """DigiPhant camera -> local Unity UDP bridge. Run with --help for setup options."""
+ import argparse
++import contextlib
+ import errno
+ import itertools
+ import json
+@@ -10,6 +11,10 @@ import time
+ 
+ FEATURES = ('LeftHandHeight', 'RightHandHeight', 'LeftFootLift', 'RightFootLift', 'Lean', 'ArmSpread')
+ MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task'
++# Optional student models (see StudentTracking/models.txt). Missing files just disable the feature.
++GESTURE_MODEL = Path(__file__).parent / 'gesture_recognizer.task'
++OBJECT_MODEL = Path(__file__).parent / 'efficientdet_lite0.tflite'
++PHONE_INTERVAL = 1 / 3  # seconds between cell phone checks
+ 
+ 
+ def extract_features(landmarks, upper_body_only=False):
+@@ -101,6 +106,51 @@ def requested_count(data):
+     return None
+ 
+ 
++def nearest_wrist(point, wrists, max_distance):
++    """Return the (slot, side) key of the closest pose wrist within max_distance, else None."""
++    best = min(wrists, key=lambda k: math.dist(point, wrists[k]), default=None)
++    return best if best is not None and math.dist(point, wrists[best]) <= max_distance else None
++
++
++class RestartingTask:
++    """Optional MediaPipe task that is rebuilt after an internal graph error instead of
++    stopping performer tracking. A failed graph cannot be reused, so it is replaced."""
++    def __init__(self, create, retry_seconds=1.0):
++        self.create, self.retry_seconds = create, retry_seconds
++        self.task, self.retry_at = create(), 0.0
++
++    def run(self, method, *args):
++        now = time.monotonic()
++        if self.task is None:
++            if now < self.retry_at:
++                return None
++            self.task = self.create()
++        try:
++            return getattr(self.task, method)(*args)
++        except RuntimeError as error:
++            print(f'{type(self.task).__name__} failed; restarting it. ({str(error).splitlines()[-1]})')
++            self.close()
++            self.retry_at = now + self.retry_seconds
++            return None
++
++    def close(self):
++        task, self.task = self.task, None
++        if task is not None:
++            try:
++                task.close()
++            except RuntimeError:
++                pass  # closing a failed graph re-raises its original error
++
++
++def send_quietly(sender, data, port):
++    """Optional packets may be dropped; they must never stop performer tracking."""
++    try:
++        sender.sendto(data, ('127.0.0.1', port))
++    except OSError as error:
++        if error.errno not in (errno.EMSGSIZE, errno.EAGAIN, errno.EWOULDBLOCK, errno.ENOBUFS):
++            raise
++
++
+ def encode_preview(frame, cv2):
+     """Fit one low-latency JPEG into a local UDP datagram, preserving aspect ratio."""
+     height, width = frame.shape[:2]
+@@ -128,8 +178,8 @@ def main():
+     parser.add_argument('--model', type=Path, default=Path(__file__).parent / 'pose_landmarker_full.task')
+     parser.add_argument('--download-model', action='store_true', help='Download the official model if missing')
+     args = parser.parse_args()
+-    if not 1024 <= args.port <= 65533:
+-        parser.error('--port must be between 1024 and 65533')
++    if not 1024 <= args.port <= 65531:
++        parser.error('--port must be between 1024 and 65531')
+     if not args.model.exists():
+         if not args.download_model:
+             parser.error('Model missing. Run again with --download-model (internet required).')
+@@ -149,6 +199,20 @@ def main():
+         running_mode=vision.RunningMode.VIDEO, num_poses=4,
+         min_pose_detection_confidence=.5, min_pose_presence_confidence=.5,
+         min_tracking_confidence=.5)
++    gesture_options = object_options = None
++    if GESTURE_MODEL.exists():
++        gesture_options = vision.GestureRecognizerOptions(
++            base_options=python.BaseOptions(model_asset_path=str(GESTURE_MODEL)),
++            running_mode=vision.RunningMode.VIDEO, num_hands=2 * args.people)
++    else:
++        print('Gesture model missing; gestures disabled.')
++    if OBJECT_MODEL.exists():
++        object_options = vision.ObjectDetectorOptions(
++            base_options=python.BaseOptions(model_asset_path=str(OBJECT_MODEL)),
++            running_mode=vision.RunningMode.IMAGE, category_allowlist=['cell phone'],
++            score_threshold=.4, max_results=3)
++    else:
++        print('Object model missing; phone detection disabled.')
+     tracker = PerformerTracker(args.people)
+     camera = cv2.VideoCapture(args.camera)
+     if not camera.isOpened():
+@@ -171,7 +235,14 @@ def main():
+     print('Stand side by side, all visible. IDs start left-to-right in the unmirrored preview.')
+     print('R: reset identities (then recalibrate in Unity). Q: quit.')
+     try:
+-        with vision.PoseLandmarker.create_from_options(options) as detector:
++        with contextlib.ExitStack() as stack:
++            detector = stack.enter_context(vision.PoseLandmarker.create_from_options(options))
++            recognizer = None
++            if gesture_options:
++                recognizer = RestartingTask(lambda: vision.GestureRecognizer.create_from_options(gesture_options))
++                stack.callback(recognizer.close)
++            phone_detector = object_options and stack.enter_context(vision.ObjectDetector.create_from_options(object_options))
++            next_phone_check, phones = 0.0, []
+             while True:
+                 for _ in range(32):
+                     try:
+@@ -202,7 +273,8 @@ def main():
+                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                 timestamp = max(previous_timestamp + 1, time.monotonic_ns() // 1_000_000)
+                 previous_timestamp = timestamp
+-                result = detector.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), timestamp)
++                image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
++                result = detector.detect_for_video(image, timestamp)
+                 observations = []
+                 for landmarks in result.pose_landmarks:
+                     center, values, confidence = extract_features(landmarks, args.upper_body_only)
+@@ -213,6 +285,31 @@ def main():
+                                                  for slot, i in assignments.items()]}
+                 sender.sendto(json.dumps(packet, allow_nan=False).encode(), ('127.0.0.1', args.port))
+                 h, w = frame.shape[:2]
++                # Hands and phones belong to the performer whose pose wrist is nearest.
++                wrists = {}
++                for slot, i in assignments.items():
++                    wrists[slot, 'left'] = (observations[i][3][15].x, observations[i][3][15].y)
++                    wrists[slot, 'right'] = (observations[i][3][16].x, observations[i][3][16].y)
++                hands = {}
++                if recognizer:
++                    gesture_result = recognizer.run('recognize_for_video', image, timestamp)
++                    for hand, gestures in zip(gesture_result.hand_landmarks, gesture_result.gestures) if gesture_result else ():
++                        key = nearest_wrist((hand[0].x, hand[0].y), wrists, .15)
++                        if key and gestures[0].category_name != 'None' and gestures[0].score > hands.get(key, ('None', 0.))[1]:
++                            hands[key] = (gestures[0].category_name, gestures[0].score)
++                    people = [{'slot': slot, 'left': hands.get((slot, 'left'), ('None', 0.))[0],
++                               'leftScore': hands.get((slot, 'left'), ('None', 0.))[1],
++                               'right': hands.get((slot, 'right'), ('None', 0.))[0],
++                               'rightScore': hands.get((slot, 'right'), ('None', 0.))[1]} for slot in assignments]
++                    send_quietly(sender, json.dumps({'version': 1, 'people': people}).encode(), args.port + 3)
++                if phone_detector and time.monotonic() >= next_phone_check:
++                    next_phone_check = time.monotonic() + PHONE_INTERVAL
++                    phones = []
++                    for d in phone_detector.detect(image).detections:
++                        box = d.bounding_box
++                        key = nearest_wrist(((box.origin_x + box.width / 2) / w, (box.origin_y + box.height / 2) / h), wrists, .25)
++                        phones.append((key[0] if key else 0, d.categories[0].score, box))
++                    send_quietly(sender, json.dumps({'version': 1, 'phones': [{'slot': s, 'score': c} for s, c, _ in phones]}).encode(), args.port + 4)
+                 # Draw every detection, even while waiting for the full group or
+                 # rejecting an ambiguous identity. Only assigned bodies drive Unity.
+                 slots = {id(observations[i][3]): slot for slot, i in assignments.items()}
+@@ -243,6 +340,14 @@ def main():
+                                     (20, 20, 20), thickness + 2, cv2.LINE_AA)
+                         cv2.putText(frame, label, anchor, cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+                                     color, thickness, cv2.LINE_AA)
++                for (slot, side), (name, score) in hands.items():
++                    x, y = wrists[slot, side]
++                    if name != 'None':
++                        cv2.putText(frame, name, (int(x * w), int(y * h)), cv2.FONT_HERSHEY_SIMPLEX, .6, colors[slot - 1], 2, cv2.LINE_AA)
++                for slot, score, box in phones:
++                    cv2.rectangle(frame, (box.origin_x, box.origin_y), (box.origin_x + box.width, box.origin_y + box.height), (0, 0, 220), thickness)
++                    cv2.putText(frame, f'phone P{slot} {score:.0%}' if slot else f'phone {score:.0%}', (box.origin_x, max(12, box.origin_y - 6)),
++                                cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 0, 220), 2, cv2.LINE_AA)
+                 message = f'{len(assignments)}/{args.people} assigned' if args.no_window else f'{len(assignments)}/{args.people} assigned | R: reassign | Q: quit'
+                 if tracker.positions is None:
+                     message = f'Waiting for {args.people} visible people' if args.no_window else f'Stand side by side: waiting for {args.people} visible people | Q: quit'
+diff --git a/Tracking/test_bridge.py b/Tracking/test_bridge.py
+index afc8566..c0aa454 100644
+--- a/Tracking/test_bridge.py
++++ b/Tracking/test_bridge.py
+@@ -1,6 +1,6 @@
+ import unittest
+ from types import SimpleNamespace
+-from bridge import PerformerTracker, extract_features, requested_count
++from bridge import PerformerTracker, RestartingTask, extract_features, requested_count
+ 
+ 
+ class TrackingTests(unittest.TestCase):
+@@ -76,5 +76,29 @@ class TrackingTests(unittest.TestCase):
+         self.assertEqual(confidence[1], 1.)
+ 
+ 
++class RestartingTaskTests(unittest.TestCase):
++    def test_graph_error_restarts_task_instead_of_stopping(self):
++        made = []
++        class Task:
++            def __init__(self):
++                self.fail, self.closed = not made, False
++                made.append(self)
++            def recognize(self, frame):
++                if self.fail:
++                    raise RuntimeError("Packet isn't the sole owner of the holder.")
++                return frame
++            def close(self):
++                self.closed = True
++                if self.fail:
++                    raise RuntimeError('graph already failed')
++        task = RestartingTask(Task, retry_seconds=0)
++        self.assertIsNone(task.run('recognize', 1))
++        self.assertTrue(made[0].closed)
++        self.assertEqual(task.run('recognize', 2), 2)
++        self.assertEqual(len(made), 2)
++        task.close()
++        self.assertTrue(made[1].closed)
++
++
+ if __name__ == '__main__':
+     unittest.main()

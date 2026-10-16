@@ -1,0 +1,12 @@
+Optional MediaPipe models for the student bridge changes (bridge-student-changes.patch, against starter commit 4e6dab5).
+Download each into DigiPhantStarter/Tracking/. If a file is missing, the bridge prints a notice and pose tracking still works.
+
+gesture_recognizer.task
+  https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task
+  sha256 97952348cf6a6a4915c2ea1496b4b37ebabc50cbbf80571435643c455f2b0482
+
+efficientdet_lite0.tflite
+  https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/1/efficientdet_lite0.tflite
+  sha256 0720bf247bd76e6594ea28fa9c6f7c5242be774818997dbbeffc4da460c723bb
+
+Apply the patch from the DigiPhantStarter folder:  git apply ../StudentTracking/bridge-student-changes.patch

@@ -112,3 +112,16 @@ InitTestScene*.unity*
 
 # Auto-generated cache in Assets folder
 /[Aa]ssets/[Ss]ceneDependencyCache*
+
+# DigiPhant starter (see DigiPhantStarter/STUDENT_GIT.md)
+# Shared starter clone, vendor elephant asset and local Python environments are
+# restored from the instructor repository, not committed here.
+# (/Recordings/ and /recordings/ are already covered by /[Rr]ecordings/ above.)
+/DigiPhantStarter/
+/Assets/Elephant/
+/Assets/Elephant.meta
+**/.venv/
+**/__pycache__/
+
+# macOS
+.DS_Store
